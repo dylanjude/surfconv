@@ -38,21 +38,6 @@ python surfconv.py mesh.ugrid --format stl-ascii
 python surfconv.py input.dat output.dat --input-format ugrid --output-format vtk
 ```
 
-### Legacy Converters
-
-Single-purpose converters are also available:
-
-```bash
-# UGRID to VTK/STL
-python ugrid2vtk.py mesh.ugrid              # Creates mesh.vtu
-python ugrid2vtk.py mesh.ugrid --vtk        # Creates mesh.vtk
-python ugrid2vtk.py mesh.ugrid --stl        # Creates mesh.stl
-python ugrid2vtk.py mesh.ugrid --stl-ascii  # Creates ASCII STL
-
-# UGRID to FACET
-python ugrid2facet.py mesh.ugrid            # Creates mesh.facet
-```
-
 ### Python API
 
 ```python
@@ -73,16 +58,6 @@ write_mesh(mesh, 'output.stl')
 # Get all faces as triangles (quads split)
 all_tris = mesh.all_triangles()
 ```
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `surfconv.py` | Unified converter with full format support |
-| `ugrid2vtk.py` | UGRID to VTK/STL converter |
-| `ugrid2facet.py` | UGRID to FACET converter |
-| `vtk_writer.py` | VTK format writer module |
-| `stl_writer.py` | STL format writer module |
 
 ## Notes
 
