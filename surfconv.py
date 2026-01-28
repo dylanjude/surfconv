@@ -582,7 +582,7 @@ def write_facet(mesh: SurfaceMesh, filename: str):
 
     with open(filename, 'w') as f:
         # Header
-        f.write("FACET FILE V3.0    exported by SurfConv\n")
+        f.write("FACET FILE V3.0    exported from Pointwise by SurfConv\n")
         f.write("1\n")
         f.write("Grid\n")
         f.write("0, 0.00 0.00 0.00 0.00\n")
