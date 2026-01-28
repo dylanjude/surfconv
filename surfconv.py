@@ -780,8 +780,8 @@ FORMATS = {
     'ugrid': {'ext': '.ugrid', 'read': read_ugrid, 'write': write_ugrid},
     'vtk': {'ext': '.vtk', 'read': read_vtk_legacy, 'write': write_vtk_legacy},
     'vtu': {'ext': '.vtu', 'read': read_vtu_xml, 'write': write_vtu_xml},
-    'stl': {'ext': '.stl', 'read': read_stl, 'write': write_stl_binary},
-    'stl-ascii': {'ext': '.stl', 'read': read_stl, 'write': write_stl_ascii},
+    'stl': {'ext': '.stl', 'read': read_stl, 'write': write_stl_ascii},
+    'stl-binary': {'ext': '.stl', 'read': read_stl, 'write': write_stl_binary},
     'facet': {'ext': '.facet', 'read': read_facet, 'write': write_facet},
     'tecplot': {'ext': '.dat', 'read': read_tecplot, 'write': write_tecplot},
 }
@@ -859,8 +859,8 @@ def print_usage():
     print("  ugrid      UGRID surface mesh (.ugrid)")
     print("  vtk        VTK Legacy ASCII (.vtk)")
     print("  vtu        VTK XML (.vtu)")
-    print("  stl        STL binary (.stl)")
-    print("  stl-ascii  STL ASCII (.stl)")
+    print("  stl        STL ASCII (.stl)")
+    print("  stl-binary STL binary (.stl)")
     print("  facet      Pointwise FACET (.facet)")
     print("  tecplot    Tecplot ASCII FE (.dat)")
     print("\nOptions:")

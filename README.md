@@ -9,8 +9,8 @@ Surface mesh converter supporting UGRID, VTK, STL, Pointwise FACET, and Tecplot 
 | UGRID | `.ugrid` | Yes | Yes | Triangles and quads |
 | VTK Legacy | `.vtk` | Yes | Yes | ASCII unstructured grid |
 | VTK XML | `.vtu` | Yes | Yes | XML unstructured grid |
-| STL Binary | `.stl` | Yes | Yes | Triangles only |
-| STL ASCII | `.stl` | Yes | Yes | Triangles only |
+| STL ASCII | `.stl` | Yes | Yes | Triangles only (default) |
+| STL Binary | `.stl` | Yes | Yes | Triangles only (--format stl-binary) |
 | FACET | `.facet` | Yes | Yes | Pointwise format |
 | Tecplot | `.dat` | Yes | Yes | ASCII finite element |
 
@@ -33,7 +33,7 @@ python surfconv.py model.vtu model.ugrid
 
 # Specify output format (generates filename automatically)
 python surfconv.py mesh.ugrid --format stl      # Creates mesh.stl
-python surfconv.py mesh.ugrid --format stl-ascii
+python surfconv.py mesh.ugrid --format stl-binary
 
 # Override format detection
 python surfconv.py input.dat output.dat --input-format ugrid --output-format vtk
