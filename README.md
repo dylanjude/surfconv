@@ -1,6 +1,6 @@
 # SurfConv
 
-Surface mesh converter supporting UGRID, VTK, STL, and Pointwise FACET formats.
+Surface mesh converter supporting UGRID, VTK, STL, Pointwise FACET, and Tecplot formats.
 
 ## Supported Formats
 
@@ -12,6 +12,7 @@ Surface mesh converter supporting UGRID, VTK, STL, and Pointwise FACET formats.
 | STL Binary | `.stl` | Yes | Yes | Triangles only |
 | STL ASCII | `.stl` | Yes | Yes | Triangles only |
 | FACET | `.facet` | Yes | Yes | Pointwise format |
+| Tecplot | `.dat` | Yes | Yes | ASCII finite element |
 
 ## Requirements
 
@@ -61,6 +62,6 @@ all_tris = mesh.all_triangles()
 
 ## Notes
 
-- Quad elements are preserved when converting between formats that support them (UGRID, VTK, FACET)
+- Quad elements are preserved when converting between formats that support them (UGRID, VTK, FACET, Tecplot)
 - STL only supports triangles; quads are automatically split into two triangles
 - Index conversion between 0-based and 1-based formats is handled automatically

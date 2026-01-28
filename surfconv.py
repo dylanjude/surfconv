@@ -611,6 +611,167 @@ def write_facet(mesh: SurfaceMesh, filename: str):
     print(f"Wrote {filename}")
 
 
+def read_tecplot(filename: str) -> SurfaceMesh:
+    """Read Tecplot ASCII finite element format (.dat) with multiple zones"""
+    mesh = SurfaceMesh()
+
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+
+    all_vertices = []
+    all_triangles = []
+    all_quads = []
+    i = 0
+
+    # Process all zones
+    while i < len(lines):
+        line = lines[i].strip().upper()
+
+        if line.startswith('ZONE'):
+            # Parse zone parameters
+            zone_line = lines[i]
+            zone_upper = zone_line.upper()
+
+            n_points = 0
+            n_elements = 0
+            elem_type = 'TRIANGLE'
+
+            # Extract N (number of points)
+            n_match = re.search(r'\bN\s*=\s*(\d+)', zone_upper)
+            if n_match:
+                n_points = int(n_match.group(1))
+
+            # Extract E (number of elements)
+            e_match = re.search(r'\bE\s*=\s*(\d+)', zone_upper)
+            if e_match:
+                n_elements = int(e_match.group(1))
+
+            # Extract ET (element type)
+            et_match = re.search(r'\bET\s*=\s*(\w+)', zone_upper)
+            if et_match:
+                elem_type = et_match.group(1)
+
+            i += 1
+
+            # Read vertex coordinates for this zone
+            zone_vertices = []
+            values = []
+            while len(zone_vertices) < n_points and i < len(lines):
+                line = lines[i].strip()
+                if line and not line.upper().startswith('ZONE') and not line.startswith('#'):
+                    values.extend(line.split())
+                    while len(values) >= 3:
+                        zone_vertices.append([float(values[0]), float(values[1]), float(values[2])])
+                        values = values[3:]
+                elif line.upper().startswith('ZONE'):
+                    break
+                i += 1
+
+            # Calculate vertex offset for this zone's connectivity
+            vertex_offset = len(all_vertices)
+
+            # Check if vertices match existing (shared vertices between zones)
+            vertices_match = False
+            if len(all_vertices) == len(zone_vertices) and len(all_vertices) > 0:
+                # Check if vertices are approximately the same
+                existing = np.array(all_vertices)
+                new = np.array(zone_vertices)
+                if np.allclose(existing, new, rtol=1e-10):
+                    vertices_match = True
+                    vertex_offset = 0
+
+            if not vertices_match:
+                all_vertices.extend(zone_vertices)
+
+            # Read element connectivity for this zone
+            elem_idx = 0
+            while elem_idx < n_elements and i < len(lines):
+                line = lines[i].strip()
+                if line and not line.upper().startswith('ZONE') and not line.startswith('#'):
+                    parts = [int(x) for x in line.split()]
+                    # Adjust for vertex offset (connectivity is 1-based, we'll convert later)
+                    if elem_type.startswith('QUAD') or len(parts) >= 4:
+                        all_quads.append([p + vertex_offset for p in parts[:4]])
+                    else:
+                        all_triangles.append([p + vertex_offset for p in parts[:3]])
+                    elem_idx += 1
+                elif line.upper().startswith('ZONE'):
+                    break
+                i += 1
+        else:
+            i += 1
+
+    # Build final mesh
+    if all_vertices:
+        mesh.vertices = np.array(all_vertices, dtype=np.float64)
+    if all_triangles:
+        mesh.triangles = np.array(all_triangles, dtype=np.int32)
+    if all_quads:
+        mesh.quads = np.array(all_quads, dtype=np.int32)
+
+    # Convert 1-based to 0-based indexing if needed
+    min_idx = float('inf')
+    if len(mesh.triangles) > 0:
+        min_idx = min(min_idx, mesh.triangles.min())
+    if len(mesh.quads) > 0:
+        min_idx = min(min_idx, mesh.quads.min())
+
+    if min_idx == 1:
+        if len(mesh.triangles) > 0:
+            mesh.triangles -= 1
+        if len(mesh.quads) > 0:
+            mesh.quads -= 1
+
+    return mesh
+
+
+def write_tecplot(mesh: SurfaceMesh, filename: str):
+    """Write Tecplot ASCII finite element format (.dat)"""
+    nv = len(mesh.vertices)
+    n3f = len(mesh.triangles)
+    n4f = len(mesh.quads)
+
+    with open(filename, 'w') as f:
+        f.write('TITLE = "Surface Mesh"\n')
+        f.write('VARIABLES = "X", "Y", "Z"\n')
+
+        # Write triangles zone if present
+        if n3f > 0:
+            f.write(f'ZONE T="Triangles", N={nv}, E={n3f}, F=FEPOINT, ET=TRIANGLE\n')
+
+            # Write vertices
+            for v in mesh.vertices:
+                f.write(f'{v[0]:.10e} {v[1]:.10e} {v[2]:.10e}\n')
+
+            # Write connectivity (1-based)
+            for tri in mesh.triangles:
+                f.write(f'{tri[0]+1} {tri[1]+1} {tri[2]+1}\n')
+
+        # Write quads zone if present
+        if n4f > 0:
+            if n3f > 0:
+                # Second zone shares vertices, but Tecplot needs them repeated
+                f.write(f'ZONE T="Quads", N={nv}, E={n4f}, F=FEPOINT, ET=QUADRILATERAL\n')
+                for v in mesh.vertices:
+                    f.write(f'{v[0]:.10e} {v[1]:.10e} {v[2]:.10e}\n')
+            else:
+                f.write(f'ZONE T="Quads", N={nv}, E={n4f}, F=FEPOINT, ET=QUADRILATERAL\n')
+                for v in mesh.vertices:
+                    f.write(f'{v[0]:.10e} {v[1]:.10e} {v[2]:.10e}\n')
+
+            # Write connectivity (1-based)
+            for quad in mesh.quads:
+                f.write(f'{quad[0]+1} {quad[1]+1} {quad[2]+1} {quad[3]+1}\n')
+
+        # If no elements, just write vertices as a point zone
+        if n3f == 0 and n4f == 0:
+            f.write(f'ZONE T="Points", I={nv}, F=POINT\n')
+            for v in mesh.vertices:
+                f.write(f'{v[0]:.10e} {v[1]:.10e} {v[2]:.10e}\n')
+
+    print(f"Wrote {filename}")
+
+
 # =============================================================================
 # FORMAT DETECTION AND DISPATCH
 # =============================================================================
@@ -622,6 +783,7 @@ FORMATS = {
     'stl': {'ext': '.stl', 'read': read_stl, 'write': write_stl_binary},
     'stl-ascii': {'ext': '.stl', 'read': read_stl, 'write': write_stl_ascii},
     'facet': {'ext': '.facet', 'read': read_facet, 'write': write_facet},
+    'tecplot': {'ext': '.dat', 'read': read_tecplot, 'write': write_tecplot},
 }
 
 
@@ -700,6 +862,7 @@ def print_usage():
     print("  stl        STL binary (.stl)")
     print("  stl-ascii  STL ASCII (.stl)")
     print("  facet      Pointwise FACET (.facet)")
+    print("  tecplot    Tecplot ASCII FE (.dat)")
     print("\nOptions:")
     print("  --format <fmt>   Output format (auto-generates filename)")
     print("  --input-format   Override input format detection")
