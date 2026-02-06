@@ -1,1 +1,7 @@
 __pycache__/
+*.ugrid
+*.vtk
+*.vtu
+*.stl
+*.facet
+*.dat
