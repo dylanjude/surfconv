@@ -13,17 +13,20 @@ import curses
 import os
 import sys
 import io
+import numpy as np
+from collections import defaultdict, deque
 from contextlib import redirect_stdout
 
 from surfconv import SurfaceMesh, read_mesh, write_mesh, detect_format, FORMATS
 from mesh_check import check_mesh_topology, check_euler_characteristic
 
 # Supported file extensions for the file browser
-SUPPORTED_EXTS = {'.ugrid', '.vtk', '.vtu', '.stl', '.facet', '.dat'}
+SUPPORTED_EXTS = {'.ugrid', '.vtk', '.vtu', '.stl', '.facet', '.dat', '.avm'}
 
 # Output formats the user can cycle through (exclude stl-binary as a separate pick;
 # we just use 'stl' which writes ASCII by default)
-OUTPUT_FORMATS = [k for k in FORMATS if k != 'stl-binary']
+OUTPUT_FORMATS = [k for k in FORMATS if FORMATS[k]['write'] is not None
+                  and k != 'stl-binary']
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +44,123 @@ def capture_output(func, *args, **kwargs):
 def fmt_number(n):
     """Format an integer with comma separators."""
     return f"{n:,}"
+
+
+def compute_outward_percentage(mesh):
+    """Percentage of face normals pointing away from the body centroid."""
+    centroid = mesh.vertices.mean(axis=0)
+    outward = 0
+    total = 0
+
+    if len(mesh.triangles) > 0:
+        v0 = mesh.vertices[mesh.triangles[:, 0]]
+        v1 = mesh.vertices[mesh.triangles[:, 1]]
+        v2 = mesh.vertices[mesh.triangles[:, 2]]
+        normals = np.cross(v1 - v0, v2 - v0)
+        centers = (v0 + v1 + v2) / 3.0
+        dots = np.sum(normals * (centers - centroid), axis=1)
+        outward += int(np.sum(dots > 0))
+        total += len(mesh.triangles)
+
+    if len(mesh.quads) > 0:
+        v0 = mesh.vertices[mesh.quads[:, 0]]
+        v1 = mesh.vertices[mesh.quads[:, 1]]
+        v2 = mesh.vertices[mesh.quads[:, 2]]
+        v3 = mesh.vertices[mesh.quads[:, 3]]
+        normals = np.cross(v1 - v0, v2 - v0)
+        centers = (v0 + v1 + v2 + v3) / 4.0
+        dots = np.sum(normals * (centers - centroid), axis=1)
+        outward += int(np.sum(dots > 0))
+        total += len(mesh.quads)
+
+    if total == 0:
+        return 0.0
+    return 100.0 * outward / total
+
+
+def make_normals_consistent(mesh):
+    """BFS to make all face normals consistent, then orient outward.
+
+    Returns (n_flipped, outward_pct).
+    """
+    n_tri = len(mesh.triangles)
+    n_quad = len(mesh.quads)
+    n_faces = n_tri + n_quad
+    if n_faces == 0:
+        return 0, 0.0
+
+    # Pre-extract as Python lists to avoid numpy scalar overhead in loops
+    tri_list = mesh.triangles.tolist() if n_tri > 0 else []
+    quad_list = mesh.quads.tolist() if n_quad > 0 else []
+
+    def get_face_edges(fid):
+        if fid < n_tri:
+            a, b, c = tri_list[fid]
+            return [(a, b), (b, c), (c, a)]
+        else:
+            a, b, c, d = quad_list[fid - n_tri]
+            return [(a, b), (b, c), (c, d), (d, a)]
+
+    # Build edge -> face adjacency
+    edge_faces = defaultdict(list)
+    for fid in range(n_faces):
+        for v1, v2 in get_face_edges(fid):
+            canon = (v1, v2) if v1 < v2 else (v2, v1)
+            edge_faces[canon].append((fid, (v1, v2)))
+
+    # BFS — propagate orientation from seed faces
+    visited = [False] * n_faces
+    flipped = [False] * n_faces
+    queue = deque()
+
+    for seed in range(n_faces):
+        if visited[seed]:
+            continue
+        visited[seed] = True
+        queue.append(seed)
+        while queue:
+            fid = queue.popleft()
+            orig_edges = get_face_edges(fid)
+            eff_edges = [(v2, v1) for v1, v2 in orig_edges] if flipped[fid] else orig_edges
+            for v1, v2 in eff_edges:
+                canon = (v1, v2) if v1 < v2 else (v2, v1)
+                neighbors = edge_faces[canon]
+                # Only propagate across manifold edges (exactly 2 faces)
+                if len(neighbors) != 2:
+                    continue
+                for nbr_fid, nbr_dir in neighbors:
+                    if nbr_fid == fid or visited[nbr_fid]:
+                        continue
+                    visited[nbr_fid] = True
+                    # Neighbor should traverse this edge opposite: (v2, v1)
+                    if nbr_dir != (v2, v1):
+                        flipped[nbr_fid] = True
+                    queue.append(nbr_fid)
+
+    # Apply flips
+    n_flipped = 0
+    for fid in range(n_faces):
+        if not flipped[fid]:
+            continue
+        n_flipped += 1
+        if fid < n_tri:
+            mesh.triangles[fid, 1], mesh.triangles[fid, 2] = (
+                mesh.triangles[fid, 2], mesh.triangles[fid, 1])
+        else:
+            qi = fid - n_tri
+            mesh.quads[qi] = mesh.quads[qi, ::-1]
+
+    # If majority point inward, flip everything
+    outward_pct = compute_outward_percentage(mesh)
+    if outward_pct < 50.0:
+        if n_tri > 0:
+            mesh.triangles[:, [1, 2]] = mesh.triangles[:, [2, 1]]
+        if n_quad > 0:
+            mesh.quads = mesh.quads[:, ::-1]
+        n_flipped = n_faces - n_flipped
+        outward_pct = 100.0 - outward_pct
+
+    return n_flipped, outward_pct
 
 
 # ---------------------------------------------------------------------------
@@ -302,11 +422,9 @@ class MeshInfoPanel(Panel):
             f"Vertices:  {fmt_number(len(mesh.vertices))}",
             f"Triangles: {fmt_number(len(mesh.triangles))}",
             f"Quads:     {fmt_number(len(mesh.quads))}",
-            "",
-            "Bounding Box:",
-            f"  X: [{bb_min[0]:.4f}, {bb_max[0]:.4f}]",
-            f"  Y: [{bb_min[1]:.4f}, {bb_max[1]:.4f}]",
-            f"  Z: [{bb_min[2]:.4f}, {bb_max[2]:.4f}]",
+            f"BBox X: [{bb_min[0]:.4f}, {bb_max[0]:.4f}]",
+            f"     Y: [{bb_min[1]:.4f}, {bb_max[1]:.4f}]",
+            f"     Z: [{bb_min[2]:.4f}, {bb_max[2]:.4f}]",
         ]
 
     def clear(self):
@@ -320,8 +438,24 @@ class MeshInfoPanel(Panel):
             return
         row0 = self.y + 1
         col0 = self.x + 1
-        for i, line in enumerate(self.lines[:ih]):
-            self.safe_addnstr(stdscr, row0 + i, col0, line, iw)
+
+        if self.scroll_offset < 0:
+            self.scroll_offset = 0
+        max_off = max(len(self.lines) - ih, 0)
+        if self.scroll_offset > max_off:
+            self.scroll_offset = max_off
+
+        for i in range(ih):
+            li = self.scroll_offset + i
+            if li >= len(self.lines):
+                break
+            self.safe_addnstr(stdscr, row0 + i, col0, self.lines[li], iw)
+
+    def handle_key(self, key):
+        if key in (ord('j'), curses.KEY_DOWN):
+            self.scroll_offset += 1
+        elif key in (ord('k'), curses.KEY_UP):
+            self.scroll_offset -= 1
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +468,7 @@ class TopologyPanel(Panel):
         self.lines = []
         self.attrs = []  # per-line color pair or 0
 
-    def set_result(self, result, chi):
+    def set_result(self, result, chi, outward_pct=None):
         self.lines = []
         self.attrs = []
 
@@ -369,6 +503,10 @@ class TopologyPanel(Panel):
             add("Orientation: CONSISTENT", CP_SUCCESS)
         else:
             add(f"Orientation: INCONSISTENT ({inc} edges)", CP_ERROR)
+
+        if outward_pct is not None:
+            pct_cp = CP_SUCCESS if outward_pct > 90 else (CP_WARNING if outward_pct > 50 else CP_ERROR)
+            add(f"Outward normals: {outward_pct:.1f}%", pct_cp)
 
         if result['consistent']:
             add("Result: PASS", CP_SUCCESS)
@@ -528,6 +666,7 @@ class HelpOverlay:
         "  /            Filter files in browser",
         "  c            Start conversion",
         "  t            Run topology check",
+        "  n            Fix normals (consistent + outward)",
         "  q            Quit",
         "  ?            Toggle this help",
         "",
@@ -631,13 +770,12 @@ class App:
         # File panel fills left column
         self.file_panel.resize(0, 0, usable_h, left_w)
 
-        # Right column: three panels stacked
-        third = usable_h // 3
-        remainder = usable_h - 3 * third
-
-        info_h = third
-        topo_h = third
-        out_h = third + remainder  # give extra rows to log
+        # Right column: three stacked panels — info gets more room (12 lines
+        # of content), topology and output split the rest.
+        info_h = min(usable_h * 2 // 5, 14)
+        rest = usable_h - info_h
+        topo_h = rest // 2
+        out_h = rest - topo_h
 
         self.info_panel.resize(0, left_w, info_h, right_w)
         self.topo_panel.resize(info_h, left_w, topo_h, right_w)
@@ -651,7 +789,7 @@ class App:
         max_y, max_x = self._max_y, self._max_x
         bar_y = max_y - 1
         attr = curses.color_pair(CP_STATUS)
-        line = " Tab:panel  j/k:nav  Enter:select  c:convert  t:check  q:quit  ?:help "
+        line = " Tab:panel  j/k:nav  Enter:select  c:convert  t:check  n:fix normals  q:quit  ?:help "
         if self._busy:
             line = f" {self._busy_label}... " + line
         try:
@@ -729,12 +867,34 @@ class App:
         try:
             result = check_mesh_topology(self.mesh)
             chi = check_euler_characteristic(self.mesh, result)
-            self.topo_panel.set_result(result, chi)
+            outward_pct = compute_outward_percentage(self.mesh)
+            self.topo_panel.set_result(result, chi, outward_pct)
             status = "PASS" if result['consistent'] else "FAIL"
             self.out_panel.add_log(f"Topology check: {status}")
         except Exception as e:
             self.out_panel.add_log(f"Topology error: {e}", error=True)
             self.topo_panel.clear()
+        finally:
+            self._busy = False
+
+    def fix_normals(self):
+        if self.mesh is None:
+            self.out_panel.add_log("No mesh loaded", error=True)
+            return
+
+        self.out_panel.add_log("Fixing normals...")
+        self._show_busy("Fixing normals")
+        try:
+            n_flipped, outward_pct = make_normals_consistent(self.mesh)
+            self.out_panel.add_log(
+                f"Flipped {fmt_number(n_flipped)} faces, "
+                f"{outward_pct:.1f}% outward")
+            # Re-run topology check to refresh the panel
+            result = check_mesh_topology(self.mesh)
+            chi = check_euler_characteristic(self.mesh, result)
+            self.topo_panel.set_result(result, chi, outward_pct)
+        except Exception as e:
+            self.out_panel.add_log(f"Normal fix error: {e}", error=True)
         finally:
             self._busy = False
 
@@ -795,6 +955,9 @@ class App:
             elif key == ord('t'):
                 if not self._busy:
                     self.run_topology_check()
+            elif key == ord('n'):
+                if not self._busy:
+                    self.fix_normals()
             else:
                 # Delegate to focused panel
                 result = self.panels[self.focus_idx].handle_key(key)

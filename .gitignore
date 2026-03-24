@@ -5,3 +5,4 @@ __pycache__/
 *.stl
 *.facet
 *.dat
+*.avm

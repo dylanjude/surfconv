@@ -772,6 +772,364 @@ def write_tecplot(mesh: SurfaceMesh, filename: str):
     print(f"Wrote {filename}")
 
 
+def _is_farfield_patch(patch_type):
+    """Return True if a boundary patch looks like a far-field boundary."""
+    ptype = patch_type.lower().replace('-', '').replace(' ', '')
+    for tag in ('farfield', 'freestream'):
+        if tag in ptype:
+            return True
+    return False
+
+
+def _read_avm_str(buf):
+    """Decode a fixed-length AVM string field, stripping null padding."""
+    return buf.split(b'\x00', 1)[0].decode('ascii', errors='replace')
+
+
+def read_avm(filename: str) -> SurfaceMesh:
+    """Read AVM surface mesh (physical boundary faces only from unstruc meshes).
+
+    Pure-Python binary reader — no compiled avmeshlib dependency needed.
+    Far-field / freestream patches are automatically excluded so the result
+    contains only body-surface faces.
+    """
+    mesh = SurfaceMesh()
+
+    with open(filename, 'rb') as f:
+        # --- File ID prefix (14 bytes) ---
+        magic_str = f.read(6)
+        if magic_str != b'AVMESH':
+            raise ValueError(f"Not an AVM file (bad magic): {filename}")
+
+        magic_num = struct.unpack('<i', f.read(4))[0]
+        if magic_num == 1:
+            endian = '<'
+        else:
+            # Try big-endian
+            magic_num = struct.unpack('>i', struct.pack('<i', magic_num))[0]
+            if magic_num == 1:
+                endian = '>'
+            else:
+                raise ValueError(f"Cannot determine endianness of AVM file")
+
+        I = endian + 'i'   # int format
+        D = endian + 'd'   # double format
+
+        revision = struct.unpack(I, f.read(4))[0]
+
+        # --- File header ---
+        # Rev0 has a different layout; rev1 and rev2 share the same file header
+        if revision == 0:
+            f.read(128)  # meshRevision
+            meshCount = struct.unpack(I, f.read(4))[0]
+            f.read(128)  # contactName
+            f.read(128)  # contactOrg
+            f.read(128)  # contactEmail
+            precision = struct.unpack(I, f.read(4))[0]
+            dimensions = struct.unpack(I, f.read(4))[0]
+            desc_size = struct.unpack(I, f.read(4))[0]
+            f.read(desc_size)  # description
+        else:
+            meshCount = struct.unpack(I, f.read(4))[0]
+            f.read(128)  # contactInfo
+            precision = struct.unpack(I, f.read(4))[0]
+            f.read(4)    # dimensions
+            desc_size = struct.unpack(I, f.read(4))[0]
+            f.read(desc_size)  # description
+
+        coord_bytes = 4 if precision == 1 else 8
+
+        all_vertices = []
+        all_triangles = []
+        all_quads = []
+        vertex_offset = 0
+
+        # --- Read all mesh headers, then data sequentially ---
+        # We need to store header info for all meshes first, because AVM
+        # stores all headers before data.
+        mesh_infos = []
+
+        for meshid in range(meshCount):
+            # Generic mesh header (layout differs by revision)
+            if revision == 0:
+                meshName = _read_avm_str(f.read(128))
+                meshType = _read_avm_str(f.read(128))
+                f.read(128)  # meshGenerator
+                f.read(128)  # changedDate
+                f.read(128)  # coordinateSystem
+                f.read(8)    # modelScale
+                f.read(128)  # gridUnits
+                f.read(8)    # reynoldsNumber
+                f.read(8)    # referenceLength
+                f.read(8)    # wallDistance
+                f.read(24)   # referencePoint[3]
+                f.read(128)  # referencePointDescription
+                f.read(8)    # periodicity
+                f.read(128)  # periodicityDescription
+                f.read(4)    # refinementLevel
+                mdesc_size = struct.unpack(I, f.read(4))[0]
+                f.read(mdesc_size)  # description
+            elif revision == 1:
+                meshName = _read_avm_str(f.read(128))
+                meshType = _read_avm_str(f.read(128))
+                f.read(128)  # meshGenerator
+                f.read(128)  # coordinateSystem
+                f.read(8)    # modelScale
+                f.read(128)  # gridUnits
+                f.read(8)    # referenceLength
+                f.read(8)    # referenceArea
+                f.read(24)   # referencePoint[3]
+                f.read(128)  # referencePointDescription
+                f.read(128)  # meshDescription
+            else:  # rev2
+                meshName = _read_avm_str(f.read(128))
+                meshType = _read_avm_str(f.read(128))
+                f.read(128)  # meshGenerator
+                f.read(128)  # coordinateSystem
+                f.read(8)    # modelScale
+                f.read(128)  # gridUnits
+                f.read(24)   # referenceLength[3]
+                f.read(8)    # referenceArea
+                f.read(24)   # referencePoint[3]
+                f.read(128)  # referencePointDescription
+                f.read(4)    # refined
+                f.read(128)  # meshDescription
+
+            info = {'name': meshName, 'type': meshType}
+
+            # Type-specific header
+            if meshType == 'unstruc':
+                if revision == 0:
+                    hdr_fields = struct.unpack(endian + '20i', f.read(80))
+                    info['nNodes']         = hdr_fields[2]
+                    info['nTriFaces']      = hdr_fields[6]
+                    info['nQuadFaces']     = hdr_fields[7]
+                    info['nBndTriFaces']   = hdr_fields[8]
+                    info['nBndQuadFaces']  = hdr_fields[9]
+                    info['nCells']         = hdr_fields[10]
+                    info['nHexCells']      = hdr_fields[13]
+                    info['nTetCells']      = hdr_fields[14]
+                    info['nPriCells']      = hdr_fields[15]
+                    info['nPyrCells']      = hdr_fields[16]
+                    info['nPatches']       = hdr_fields[17]
+                    info['nEdges']         = 0
+                    info['nNodesOnGeometry'] = 0
+                    info['nEdgesOnGeometry'] = 0
+                    info['nFacesOnGeometry'] = 0
+                    info['nPolyCells']     = 0
+                    info['nPolyFaces']     = 0
+                    info['nBndPolyFaces']  = 0
+                    info['bndPolyFacesSize'] = 0
+                    info['polyFacesSize']  = 0
+                elif revision == 1:
+                    hdr_fields = struct.unpack(endian + '25i', f.read(100))
+                    info['nNodes']         = hdr_fields[0]
+                    info['nCells']         = hdr_fields[2]
+                    info['nPatches']       = hdr_fields[6]
+                    info['nHexCells']      = hdr_fields[7]
+                    info['nTetCells']      = hdr_fields[8]
+                    info['nPriCells']      = hdr_fields[9]
+                    info['nPyrCells']      = hdr_fields[10]
+                    info['nPolyCells']     = hdr_fields[11]
+                    info['nBndTriFaces']   = hdr_fields[12]
+                    info['nTriFaces']      = hdr_fields[13]
+                    info['nBndQuadFaces']  = hdr_fields[14]
+                    info['nQuadFaces']     = hdr_fields[15]
+                    info['nBndPolyFaces']  = hdr_fields[16]
+                    info['nPolyFaces']     = hdr_fields[17]
+                    info['bndPolyFacesSize'] = hdr_fields[18]
+                    info['polyFacesSize']  = hdr_fields[19]
+                    info['nEdges']         = hdr_fields[20]
+                    info['nNodesOnGeometry'] = hdr_fields[21]
+                    info['nEdgesOnGeometry'] = hdr_fields[22]
+                    info['nFacesOnGeometry'] = hdr_fields[23]
+                else:  # rev2
+                    # 6 ints, 32-byte string, then 16 more ints
+                    first6 = struct.unpack(endian + '6i', f.read(24))
+                    f.read(32)  # elementScheme
+                    rest = struct.unpack(endian + '16i', f.read(64))
+                    info['nNodes']         = first6[0]
+                    info['nCells']         = first6[2]
+                    info['facePolyOrder']  = rest[0]
+                    info['cellPolyOrder']  = rest[1]
+                    info['nPatches']       = rest[2]
+                    info['nHexCells']      = rest[3]
+                    info['nTetCells']      = rest[4]
+                    info['nPriCells']      = rest[5]
+                    info['nPyrCells']      = rest[6]
+                    info['nBndTriFaces']   = rest[7]
+                    info['nTriFaces']      = rest[8]
+                    info['nBndQuadFaces']  = rest[9]
+                    info['nQuadFaces']     = rest[10]
+                    info['nEdges']         = rest[11]
+                    info['nNodesOnGeometry'] = rest[12]
+                    info['nEdgesOnGeometry'] = rest[13]
+                    info['nFacesOnGeometry'] = rest[14]
+                    # rest[15] = geomRegionId (unused)
+                    info['nPolyCells']     = 0
+                    info['nPolyFaces']     = 0
+                    info['nBndPolyFaces']  = 0
+                    info['bndPolyFacesSize'] = 0
+                    info['polyFacesSize']  = 0
+
+                # Read patch headers (48 bytes each: 32s label + 16s type + int id)
+                patches = []
+                skip_patches = set()
+                for _ in range(info['nPatches']):
+                    plabel = _read_avm_str(f.read(32))
+                    ptype = _read_avm_str(f.read(16))
+                    patch_id = struct.unpack(I, f.read(4))[0]
+                    patches.append((plabel, ptype, patch_id))
+                    if _is_farfield_patch(ptype):
+                        skip_patches.add(abs(patch_id))
+                        print(f"  Skipping far-field patch: {plabel!r} "
+                              f"(type={ptype!r})")
+                info['patches'] = patches
+                info['skip_patches'] = skip_patches
+
+            elif meshType == 'bfstruc':
+                if revision == 0:
+                    f.read(8)    # jmax, kmax
+                    f.read(4)    # lmax ... (need to skip the right amount)
+                    # This is complex; for now just record type to skip later
+                    pass
+                # Skip bfstruc headers — we only care about unstruc
+                # The exact size depends on revision; handled in data skip below
+                pass
+
+            # For non-unstruc types, we'd need to skip their type-specific
+            # headers. For simplicity, assume all meshes are unstruc.
+            # TODO: handle bfstruc/strand/cart header skipping if needed
+
+            mesh_infos.append(info)
+
+        # --- Read mesh data ---
+        for info in mesh_infos:
+            if info['type'] != 'unstruc':
+                # Skip non-unstruc mesh data (not implemented)
+                continue
+
+            h = info
+            nNodes = h['nNodes']
+            skip = h['skip_patches']
+
+            # Read nodes
+            node_data = f.read(3 * nNodes * coord_bytes)
+            fmt = endian + str(3 * nNodes) + ('f' if precision == 1 else 'd')
+            coords = struct.unpack(fmt, node_data)
+            verts = np.array(coords, dtype=np.float64).reshape(nNodes, 3)
+            all_vertices.append(verts)
+
+            # Face strides depend on facePolyOrder:
+            #   nodesPerTri = (p+1)*(p+2)/2, nodesPerQuad = (p+1)^2
+            #   stride = nodesPerFace + 1 (for cell ID)
+            # For linear (p=1): tri=4 (3 nodes + cellID), quad=5 (4 nodes + cellID)
+            fpo = h.get('facePolyOrder', 1)
+            nodes_per_tri = ((fpo + 1) * (fpo + 2)) // 2
+            nodes_per_quad = (fpo + 1) * (fpo + 1)
+            tri_stride = nodes_per_tri + 1
+            quad_stride = nodes_per_quad + 1
+
+            # Read boundary tri faces
+            # Format: n1, n2, ..., nN, cellID  (boundary faces written first)
+            # Boundary faces have negative cellID = -(patch_id)
+            nBndTri = h['nBndTriFaces']
+            if nBndTri > 0:
+                buf = f.read(tri_stride * nBndTri * 4)
+                raw = struct.unpack(endian + str(tri_stride * nBndTri) + 'i', buf)
+                kept = []
+                for i in range(nBndTri):
+                    base = i * tri_stride
+                    n1, n2, n3 = raw[base], raw[base+1], raw[base+2]
+                    cell_id = raw[base + tri_stride - 1]  # last value
+                    patch_id = abs(cell_id)
+                    if patch_id not in skip:
+                        kept.append([n1 - 1 + vertex_offset,
+                                     n2 - 1 + vertex_offset,
+                                     n3 - 1 + vertex_offset])
+                if kept:
+                    all_triangles.append(np.array(kept, dtype=np.int32))
+
+            # Read boundary quad faces
+            nBndQuad = h['nBndQuadFaces']
+            if nBndQuad > 0:
+                buf = f.read(quad_stride * nBndQuad * 4)
+                raw = struct.unpack(endian + str(quad_stride * nBndQuad) + 'i', buf)
+                kept = []
+                for i in range(nBndQuad):
+                    base = i * quad_stride
+                    n1, n2, n3, n4 = raw[base], raw[base+1], raw[base+2], raw[base+3]
+                    cell_id = raw[base + quad_stride - 1]  # last value
+                    patch_id = abs(cell_id)
+                    if patch_id not in skip:
+                        kept.append([n1 - 1 + vertex_offset,
+                                     n2 - 1 + vertex_offset,
+                                     n3 - 1 + vertex_offset,
+                                     n4 - 1 + vertex_offset])
+                if kept:
+                    all_quads.append(np.array(kept, dtype=np.int32))
+
+            # Skip remaining data: interior faces, cells, edges, geometry
+            nIntTri = h['nTriFaces'] - nBndTri
+            nIntQuad = h['nQuadFaces'] - nBndQuad
+
+            # Cell strides depend on cellPolyOrder
+            cpo = h.get('cellPolyOrder', 1)
+            nph = (cpo + 1) ** 3                               # hex
+            npt = ((cpo + 1) * (cpo + 2) * (cpo + 3)) // 6    # tet
+            npp = ((cpo + 1) * (cpo + 1) * (cpo + 2)) // 2    # pri
+            npy = ((cpo + 1) * (cpo + 2) * (2*cpo + 3)) // 6  # pyr
+
+            skip_bytes = (
+                tri_stride * nIntTri * 4 +                   # interior tris
+                quad_stride * nIntQuad * 4 +                 # interior quads
+                h.get('bndPolyFacesSize', 0) * 4 +           # bnd polys
+                (h.get('polyFacesSize', 0) -
+                 h.get('bndPolyFacesSize', 0)) * 4 +         # int polys
+                nph * h['nHexCells'] * 4 +                   # hex cells
+                npt * h['nTetCells'] * 4 +                   # tet cells
+                npp * h['nPriCells'] * 4 +                   # pri cells
+                npy * h['nPyrCells'] * 4 +                   # pyr cells
+                2 * h['nEdges'] * 4                          # edges
+            )
+            # AMR/geometry data (node: 2 ints + 1 double = 16 bytes)
+            skip_bytes += h['nNodesOnGeometry'] * 16
+            skip_bytes += 3 * h['nEdgesOnGeometry'] * 4
+            skip_bytes += 3 * h['nFacesOnGeometry'] * 4
+            # Volume IDs
+            skip_bytes += (h['nHexCells'] + h['nTetCells'] +
+                           h['nPriCells'] + h['nPyrCells']) * 4
+            f.seek(skip_bytes, 1)
+
+            vertex_offset += nNodes
+
+    # Combine all meshes
+    if all_vertices:
+        all_verts = np.vstack(all_vertices)
+    else:
+        all_verts = np.zeros((0, 3), dtype=np.float64)
+    if all_triangles:
+        all_tris = np.vstack(all_triangles)
+    else:
+        all_tris = np.zeros((0, 3), dtype=np.int32)
+    if all_quads:
+        all_quads_arr = np.vstack(all_quads)
+    else:
+        all_quads_arr = np.zeros((0, 4), dtype=np.int32)
+
+    # Compact vertices — only keep nodes referenced by surface faces
+    used = np.unique(np.concatenate([all_tris.ravel(), all_quads_arr.ravel()]))
+    old_to_new = np.full(len(all_verts), -1, dtype=np.int32)
+    old_to_new[used] = np.arange(len(used), dtype=np.int32)
+    mesh.vertices = all_verts[used]
+    if len(all_tris) > 0:
+        mesh.triangles = old_to_new[all_tris]
+    if len(all_quads_arr) > 0:
+        mesh.quads = old_to_new[all_quads_arr]
+
+    return mesh
+
+
 # =============================================================================
 # FORMAT DETECTION AND DISPATCH
 # =============================================================================
@@ -784,6 +1142,7 @@ FORMATS = {
     'stl-binary': {'ext': '.stl', 'read': read_stl, 'write': write_stl_binary},
     'facet': {'ext': '.facet', 'read': read_facet, 'write': write_facet},
     'tecplot': {'ext': '.dat', 'read': read_tecplot, 'write': write_tecplot},
+    'avm': {'ext': '.avm', 'read': read_avm, 'write': None},
 }
 
 
@@ -828,6 +1187,9 @@ def write_mesh(mesh: SurfaceMesh, filename: str, format: Optional[str] = None):
     if format not in FORMATS:
         raise ValueError(f"Unknown format: {format}")
 
+    if FORMATS[format]['write'] is None:
+        raise ValueError(f"Writing {format.upper()} format is not supported (read-only)")
+
     if format == 'stl' and len(mesh.quads) > 0:
         n_quad_tris = len(mesh.quads) * 2
         print(f"  Note: Converting {len(mesh.quads)} quads to {n_quad_tris} triangles for STL")
@@ -863,6 +1225,7 @@ def print_usage():
     print("  stl-binary STL binary (.stl)")
     print("  facet      Pointwise FACET (.facet)")
     print("  tecplot    Tecplot ASCII FE (.dat)")
+    print("  avm        AVMesh surface (.avm) [read-only]")
     print("\nOptions:")
     print("  --format <fmt>   Output format (auto-generates filename)")
     print("  --input-format   Override input format detection")
