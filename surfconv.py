@@ -773,9 +773,9 @@ def write_tecplot(mesh: SurfaceMesh, filename: str):
 
 
 def _is_farfield_patch(patch_type):
-    """Return True if a boundary patch looks like a far-field boundary."""
+    """Return True if a boundary patch looks like a non-physical boundary."""
     ptype = patch_type.lower().replace('-', '').replace(' ', '')
-    for tag in ('farfield', 'freestream'):
+    for tag in ('farfield', 'freestream', 'overset'):
         if tag in ptype:
             return True
     return False
